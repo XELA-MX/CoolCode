@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+*.toml.local
+
+# Local agent config in repo root — often contains api_key / bot_token; do not commit.
+perplex-agent.toml
