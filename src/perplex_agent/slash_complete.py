@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
-from prompt_toolkit.completion import Completer, Completion
+from collections.abc import Iterable
+
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion, PathCompleter, merge_completers
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.styles import Style
 
@@ -19,6 +23,7 @@ SLASH_HELP: tuple[tuple[str, str], ...] = (
     ("/mode", "Modo actual"),
     ("/mode orchestrator", "Planificador + subagentes"),
     ("/mode direct", "Una llamada Sonar por mensaje"),
+    ("/workspace", "Muestra la raíz del workspace"),
     ("/model", "Modelo Sonar activo o lista"),
     ("/model list", "Modelos Sonar permitidos"),
     ("/model reset", "Quitar override de sesión (CLI/TOML)"),
@@ -30,9 +35,43 @@ SLASH_HELP: tuple[tuple[str, str], ...] = (
     ("/telegram", "Cómo arrancar el bot"),
     ("/telegram run", "Arrancar bot aquí (bloquea la terminal)"),
     ("/version", "Versión"),
+    ("/set-workspace", "Cambiar workspace (Tab completa rutas a directorios)"),
 )
 
 SLASH_COMMANDS: tuple[str, ...] = tuple(sorted({row[0] for row in SLASH_HELP}))
+
+# `/set-workspace ` + path fragment (command segment case-insensitive).
+_SET_WORKSPACE_RE = re.compile(r"(?i)^\s*(/set-workspace)(\s+)(.*)$")
+
+
+class SetWorkspacePathCompleter(Completer):
+    """Directory path completions after ``/set-workspace `` (does not fire on the command token)."""
+
+    def __init__(self) -> None:
+        self._paths = PathCompleter(only_directories=True, expanduser=True, min_input_len=0)
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
+        text = document.text_before_cursor
+        m = _SET_WORKSPACE_RE.match(text)
+        if not m:
+            return
+        path_fragment = m.group(3)
+        if not path_fragment.strip():
+            return
+        sub = Document(path_fragment, cursor_position=len(path_fragment))
+        yield from self._paths.get_completions(sub, complete_event)
+
+
+def shell_prompt_completer() -> Completer:
+    """Slash commands + path completion for ``/set-workspace``."""
+    return merge_completers(
+        [
+            SlashCommandCompleter(),
+            SetWorkspacePathCompleter(),
+        ]
+    )
 
 
 class SlashCommandCompleter(Completer):

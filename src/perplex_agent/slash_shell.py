@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal
 
 from prompt_toolkit import PromptSession
@@ -19,17 +20,19 @@ from perplex_agent.config import (
     Settings,
     resolve_sonar_chat_model,
 )
-from perplex_agent.orchestrator import DIRECT_ASSISTANT_SYSTEM, Orchestrator
+from perplex_agent.direct_tools import run_direct_tool_session
+from perplex_agent.orchestrator import Orchestrator, direct_system_for_settings
 from perplex_agent.planning import fallback_plan, propose_execution_plan
 from perplex_agent.setup_wizard import ensure_perplexity_configured, ensure_telegram_ready, run_setup_wizard
 from perplex_agent.slash_complete import (
     SLASH_HELP,
-    SlashCommandCompleter,
+    shell_prompt_completer,
     slash_prompt_message,
     slash_prompt_style,
 )
 from perplex_agent.subagents import extract_message_content
 from perplex_agent.telegram_bot import run_telegram_with_gate
+from perplex_agent.workspace import normalize_workspace_root
 from perplex_agent.ui import (
     confirm_or_abort,
     confirm_spawn_batch,
@@ -37,6 +40,7 @@ from perplex_agent.ui import (
     print_banner,
     print_final_answer,
     print_subagents_history,
+    print_workspace_status,
     render_direct_preflight,
     render_plan_panel,
 )
@@ -86,6 +90,8 @@ class ShellOptions:
     confirm_spawns: bool = False
     confirm_each: bool = False
     plan_each: bool = False
+    # If set, passed to Settings.load(workspace_override=...) for the whole session.
+    workspace: Path | None = None
 
 
 @dataclass
@@ -99,7 +105,12 @@ class _ShellState:
 
 async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
     console = get_console()
-    print_banner(console)
+    try:
+        settings = Settings.load(workspace_override=opts.workspace)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    print_banner(console, workspace=settings.workspace_dir)
     console.print(
         Panel(
             "[bold]Chat[/bold] — mensaje libre o [cyan]/help[/cyan]. "
@@ -124,7 +135,7 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
         return state.orchestrator
 
     session = PromptSession(
-        completer=SlashCommandCompleter(),
+        completer=shell_prompt_completer(),
         complete_while_typing=True,
         style=slash_prompt_style(),
         message=slash_prompt_message(),
@@ -165,7 +176,7 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
                     telegram=True,
                     probe_key=not tg_only,
                 )
-                settings = Settings.load()
+                settings = Settings.load(workspace_override=opts.workspace)
                 continue
 
             if cmd == "/clear":
@@ -176,7 +187,7 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
 
             if cmd == "/model":
                 arg = rest.strip().lower()
-                s_cfg = Settings.load()
+                s_cfg = Settings.load(workspace_override=opts.workspace)
                 cur = _shell_model(state, opts, s_cfg)
                 if not arg or arg == "list":
                     t = Table(
@@ -202,7 +213,7 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
                     state.session_model = None
                     state.orchestrator = None
                     state.direct_client = None
-                    s2 = Settings.load()
+                    s2 = Settings.load(workspace_override=opts.workspace)
                     nxt = _shell_model(state, opts, s2)
                     console.print(f"[green]Modelo:[/green] [cyan]{nxt}[/cyan] (CLI o TOML)")
                     continue
@@ -222,7 +233,7 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
 
             if cmd == "/mode":
                 arg = rest.lower().strip()
-                s_m = Settings.load()
+                s_m = Settings.load(workspace_override=opts.workspace)
                 cur_m = _shell_model(state, opts, s_m)
                 if not arg:
                     console.print(
@@ -241,26 +252,84 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
                 console.print("[yellow]Uso:[/yellow] /mode direct  |  /mode orchestrator")
                 continue
 
+            if cmd == "/workspace":
+                s_ws = Settings.load(workspace_override=opts.workspace)
+                console.print(
+                    Panel(
+                        f"[bold]Raíz del workspace[/bold]\n[cyan]{s_ws.workspace_dir}[/cyan]\n\n"
+                        "[dim]Se fija con [cyan]--workspace[/cyan] / [cyan]-C[/cyan], "
+                        "variable [cyan]PERPLEX_AGENT_WORKSPACE[/cyan], o "
+                        "[cyan][workspace][/cyan] en config TOML ([cyan]path[/cyan]). "
+                        "En esta REPL: [bold]/set-workspace[/bold] (Tab en rutas) o "
+                        "[cyan]/set-workspace reset[/cyan].[/dim]",
+                        title="Workspace",
+                        border_style="blue",
+                    )
+                )
+                continue
+
+            if cmd == "/set-workspace":
+                arg = rest.strip()
+                if not arg:
+                    cur = Settings.load(workspace_override=opts.workspace).workspace_dir
+                    console.print(
+                        Panel(
+                            f"Workspace actual: [cyan]{cur}[/cyan]\n\n"
+                            "Uso: [bold]/set-workspace /ruta/al/proyecto[/bold]  o  [bold]~/src/foo[/bold]\n"
+                            "[dim]Tab completa directorios mientras escribes la ruta (tras un espacio).[/dim]\n"
+                            "[dim][cyan]/set-workspace reset[/cyan] — quita override de sesión (cwd / env / TOML).[/dim]",
+                            title="set-workspace",
+                            border_style="blue",
+                        )
+                    )
+                    continue
+
+                reset_tokens = frozenset({"reset", "default", "clear"})
+                before = Settings.load(workspace_override=opts.workspace).workspace_dir
+
+                if arg.lower() in reset_tokens:
+                    opts.workspace = None
+                else:
+                    try:
+                        opts.workspace = normalize_workspace_root(Path(arg).expanduser())
+                    except ValueError as e:
+                        console.print(f"[red]{e}[/red]")
+                        continue
+
+                after = Settings.load(workspace_override=opts.workspace).workspace_dir
+                if after != before:
+                    state.orchestrator = None
+                    state.direct_client = None
+                    console.print(
+                        f"[green]Workspace recargado:[/green] [cyan]{after}[/cyan]\n"
+                        "[dim]Orquestador y cliente direct reiniciados (nueva raíz en prompts).[/dim]"
+                    )
+                    print_workspace_status(console, workspace=after)
+                else:
+                    console.print(f"[dim]Workspace sin cambios:[/dim] [cyan]{after}[/cyan]")
+                continue
+
             if cmd == "/subagents":
-                print_subagents_history(Settings.load(), console=console, limit=35)
+                print_subagents_history(Settings.load(workspace_override=opts.workspace), console=console, limit=35)
                 continue
 
             if cmd == "/telegram":
                 if rest.lower().strip() == "run":
-                    s = Settings.load()
+                    s = Settings.load(workspace_override=opts.workspace)
                     if not await ensure_telegram_ready(console):
                         continue
-                    s = Settings.load()
+                    s = Settings.load(workspace_override=opts.workspace)
                     run_telegram_with_gate(
                         assume_yes=_effective_yes(s, opts.assume_yes),
                         console=console,
+                        force_daemon_thread=True,
                     )
                     continue
                 console.print(
                     Panel(
-                        "Long-polling bloquea esta terminal.\n\n"
-                        "[bold]Otra terminal:[/bold] [cyan]perplex-agent telegram run[/cyan]\n"
-                        "[bold]Aquí:[/bold] [cyan]/telegram run[/cyan]",
+                        "[cyan]perplex-agent telegram run[/cyan] en otra terminal bloquea solo esa sesión.\n\n"
+                        "[bold]Aquí:[/bold] [cyan]/telegram run[/cyan] — en esta REPL el bot usa un hilo en "
+                        "segundo plano (puedes seguir chateando).",
                         title="Telegram",
                         border_style="blue",
                     )
@@ -271,11 +340,11 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
             continue
 
         # User message
-        s = Settings.load()
+        s = Settings.load(workspace_override=opts.workspace)
         if not s.perplexity_api_key:
             if not await ensure_perplexity_configured(console):
                 console.print("[dim]Usa [cyan]/setup[/cyan] o exporta PERPLEXITY_API_KEY.[/dim]")
-            s = Settings.load()
+            s = Settings.load(workspace_override=opts.workspace)
             if not s.perplexity_api_key:
                 continue
 
@@ -293,10 +362,20 @@ async def run_slash_shell(settings: Settings, opts: ShellOptions) -> None:
                     console.print("[dim]Cancelado.[/dim]")
                     continue
             messages = [
-                {"role": "system", "content": DIRECT_ASSISTANT_SYSTEM},
+                {"role": "system", "content": direct_system_for_settings(s)},
                 {"role": "user", "content": line},
             ]
-            if opts.stream:
+            if s.direct_tools_enabled and not opts.stream:
+                answer = await run_direct_tool_session(
+                    state.direct_client,
+                    s,
+                    m,
+                    line,
+                    system_prompt=direct_system_for_settings(s),
+                    extra=dextra,
+                )
+                print_final_answer(answer, console=console)
+            elif opts.stream:
                 async for chunk in state.direct_client.chat_completion_stream_text(
                     model=m, messages=messages, extra=dextra
                 ):

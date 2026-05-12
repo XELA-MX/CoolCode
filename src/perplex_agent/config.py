@@ -9,6 +9,8 @@ from typing import Any
 
 import tomllib
 
+from perplex_agent.workspace import normalize_workspace_root
+
 
 def _clamp_tokens(n: int, lo: int = 256, hi: int = 32000) -> int:
     return max(lo, min(hi, int(n)))
@@ -85,6 +87,19 @@ class Settings:
     direct_temperature: float = 0.35
     history_max_chars: int = 28000
     inject_subagent_max_chars: int = 5200
+    # Absolute directory: default cwd at load time; override via env, TOML, or CLI --workspace.
+    workspace_dir: Path = field(default_factory=lambda: Path.cwd().resolve())
+    # Local read-only tools in direct (non-stream) and orchestrator JSON steps.
+    direct_tools_enabled: bool = True
+    max_direct_tool_iterations: int = 12
+    tool_read_max_bytes: int = 65536
+    # Line-numbered preview in read_file tool output (full file still byte-capped first).
+    tool_read_preview_lines: int = 120
+    tool_list_max_entries: int = 200
+    tool_glob_max_matches: int = 200
+    # Tighter caps when tools run from Telegram (reduces paste wall + model re-dumping).
+    tool_telegram_read_max_bytes: int = 8192
+    tool_telegram_read_preview_lines: int = 40
 
     def extra_for_planner(self) -> dict[str, Any]:
         return {
@@ -111,7 +126,7 @@ class Settings:
         }
 
     @classmethod
-    def load(cls) -> Settings:
+    def load(cls, workspace_override: Path | str | None = None) -> Settings:
         file_cfg = _load_toml_files()
         p = file_cfg.get("perplexity", {}) or {}
         s = file_cfg.get("subagents", {}) or {}
@@ -119,6 +134,7 @@ class Settings:
         o = file_cfg.get("orchestrator", {}) or {}
         cli_cfg = file_cfg.get("cli", {}) or {}
         tok = file_cfg.get("tokens", {}) or {}
+        tools_cfg = file_cfg.get("tools", {}) or {}
 
         api_key = os.environ.get("PERPLEXITY_API_KEY") or p.get("api_key") or ""
         if not isinstance(api_key, str):
@@ -162,6 +178,20 @@ class Settings:
             state_path = Path(str(state_raw)).expanduser()
         else:
             state_path = state_default
+
+        def _workspace_dir() -> Path:
+            if workspace_override is not None:
+                return normalize_workspace_root(Path(str(workspace_override)).expanduser())
+            env_ws = os.environ.get("PERPLEX_AGENT_WORKSPACE")
+            if env_ws:
+                return normalize_workspace_root(Path(env_ws).expanduser())
+            wsec = file_cfg.get("workspace", {}) or {}
+            raw_ws = wsec.get("path")
+            if raw_ws:
+                return normalize_workspace_root(Path(str(raw_ws)).expanduser())
+            return normalize_workspace_root(Path.cwd())
+
+        workspace_path = _workspace_dir()
 
         return cls(
             perplexity_api_key=api_key,
@@ -215,6 +245,35 @@ class Settings:
             ),
             inject_subagent_max_chars=env_int(
                 "INJECT_SUBAGENT_MAX_CHARS", int(tok.get("inject_subagent_max_chars", 5200))
+            ),
+            workspace_dir=workspace_path,
+            direct_tools_enabled=env_bool(
+                "PERPLEX_AGENT_DIRECT_TOOLS", bool(tools_cfg.get("direct_tools", True))
+            ),
+            max_direct_tool_iterations=env_int(
+                "PERPLEX_AGENT_MAX_DIRECT_TOOL_ITERATIONS",
+                int(tools_cfg.get("max_direct_tool_iterations", 12)),
+            ),
+            tool_read_max_bytes=env_int(
+                "PERPLEX_AGENT_TOOL_READ_MAX_BYTES", int(tools_cfg.get("read_max_bytes", 65536))
+            ),
+            tool_read_preview_lines=env_int(
+                "PERPLEX_AGENT_TOOL_READ_PREVIEW_LINES",
+                int(tools_cfg.get("read_preview_lines", 120)),
+            ),
+            tool_list_max_entries=env_int(
+                "PERPLEX_AGENT_TOOL_LIST_MAX", int(tools_cfg.get("list_max_entries", 200))
+            ),
+            tool_glob_max_matches=env_int(
+                "PERPLEX_AGENT_TOOL_GLOB_MAX", int(tools_cfg.get("glob_max_matches", 200))
+            ),
+            tool_telegram_read_max_bytes=env_int(
+                "PERPLEX_AGENT_TOOL_TELEGRAM_READ_MAX_BYTES",
+                int(tools_cfg.get("telegram_read_max_bytes", 8192)),
+            ),
+            tool_telegram_read_preview_lines=env_int(
+                "PERPLEX_AGENT_TOOL_TELEGRAM_PREVIEW_LINES",
+                int(tools_cfg.get("telegram_read_preview_lines", 40)),
             ),
         )
 

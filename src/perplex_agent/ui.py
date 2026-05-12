@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import textwrap
 import time
 from typing import Any
@@ -35,6 +36,19 @@ def get_console() -> Console:
     return Console(theme=CUSTOM_THEME)
 
 
+def print_separator(console: Console | None = None) -> None:
+    if console is None:
+        console = get_console()
+    console.print("─" * console.width)
+
+
+def print_workspace_status(console: Console | None = None, *, workspace: Path) -> None:
+    """Print the same workspace strip as in the banner (for refresh after /set-workspace)."""
+    c = console or get_console()
+    print_separator(c)
+    c.print(f"[dim]Workspace[/dim] [cyan]{escape(str(workspace.resolve()))}[/cyan]")
+    print_separator(c)
+
 # Block letters "COOLCODE" (~72 cols), UTF-8 box drawing — looks sharp on modern terminals.
 _COOLCODE_ASCII: tuple[str, ...] = (
     r"  ██████╗ ██████╗  ██████╗ ██╗         ██████╗ ██████╗ ██████╗ ███████╗",
@@ -58,7 +72,7 @@ def _banner_line_style(index: int, total: int) -> str:
     return "dim cyan"
 
 
-def print_banner(console: Console | None = None, *, animate: bool = True) -> None:
+def print_banner(console: Console | None = None, *, animate: bool = True, workspace: Path | None = None) -> None:
     c = console or get_console()
     animate = bool(animate and not os.environ.get("PERPLEX_AGENT_NO_BANNER_ANIM"))
     # We clear the console so we can print the banner in a clean way
@@ -86,8 +100,11 @@ def print_banner(console: Console | None = None, *, animate: bool = True) -> Non
         )
     )
 
-    # Now we print a separator line by the console width
-    c.print("─" * c.width)
+    if workspace is not None:
+        print_workspace_status(c, workspace=workspace)
+    else:
+        print_separator(c)
+        print_separator(c)
 
 
 def render_plan_panel(plan: ExecutionPlan, console: Console | None = None) -> None:

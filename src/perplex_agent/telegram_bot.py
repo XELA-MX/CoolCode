@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+from typing import Any
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-
-from typing import Any
 
 from perplex_agent.config import Settings
 from perplex_agent.orchestrator import Orchestrator
@@ -71,7 +73,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:  # noqa: BLE001
                 log.exception("announce subagent failed")
 
-    orch = Orchestrator(settings, on_subagent_complete=on_sub)
+    orch = Orchestrator(settings, on_subagent_complete=on_sub, tool_result_channel="telegram")
     try:
         result = await orch.run(text, stream=False)
     except Exception as e:  # noqa: BLE001
@@ -83,7 +85,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(part)
 
 
-def run_polling_blocking() -> None:
+def _telegram_polling_main(*, for_background_thread: bool = False) -> None:
+    """Build the app and block in PTB polling (must run without a foreign asyncio loop).
+
+    On a non-main thread, asyncio cannot install signal handlers; pass ``stop_signals=None``
+    so python-telegram-bot skips ``add_signal_handler`` (see PTB docs for :meth:`run_polling`).
+    """
     logging.basicConfig(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         level=logging.INFO,
@@ -104,13 +111,48 @@ def run_polling_blocking() -> None:
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Starting Telegram polling…")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    poll_kw: dict[str, Any] = {"allowed_updates": Update.ALL_TYPES}
+    if for_background_thread:
+        poll_kw["stop_signals"] = None
+    application.run_polling(**poll_kw)
+
+
+def run_polling_blocking(
+    *,
+    console: Any | None = None,
+    force_daemon_thread: bool = False,
+) -> None:
+    """Start long polling on the current thread, or on a daemon thread if asyncio is already running."""
+    use_thread = force_daemon_thread
+    if not use_thread:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            _telegram_polling_main()
+            return
+        use_thread = True
+
+    c = console
+    if c is not None:
+        c.print(
+            "[green]Bot de Telegram en segundo plano[/green] (hilo dedicado). "
+            "Puedes seguir usando el chat; al salir de perplex-agent el bot se detiene. "
+            "[dim]Ctrl+C solo afecta al hilo principal; cierra con /quit o Ctrl+D.[/dim]"
+        )
+    thread = threading.Thread(
+        target=_telegram_polling_main,
+        kwargs={"for_background_thread": True},
+        name="perplex-agent-telegram",
+        daemon=True,
+    )
+    thread.start()
 
 
 def run_telegram_with_gate(
     *,
     assume_yes: bool,
     console: Any | None = None,
+    force_daemon_thread: bool = False,
 ) -> None:
     """Confirm + start long-polling (blocking). Used from CLI and slash shell."""
     from rich.console import Console
@@ -132,4 +174,4 @@ def run_telegram_with_gate(
         ):
             c.print("[yellow]Cancelado.[/yellow]")
             return
-    run_polling_blocking()
+    run_polling_blocking(console=c, force_daemon_thread=force_daemon_thread)

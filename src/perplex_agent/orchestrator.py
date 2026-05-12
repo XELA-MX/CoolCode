@@ -11,13 +11,31 @@ from perplex_agent.client import PerplexityAPIError, PerplexityClient
 from perplex_agent.config import Settings
 from perplex_agent.history_compact import trim_planner_history
 from perplex_agent.subagents import SubagentManager, SubagentRecord, extract_message_content
+from perplex_agent.tool_defs import (
+    DIRECT_TOOL_INSTRUCTIONS,
+    TOOLS_CAPABILITY_LINES,
+    build_agent_step_response_format,
+)
+from perplex_agent.tool_runtime import run_tool_calls
+
+AGENT_STEP_RESPONSE_FORMAT: dict[str, Any] = build_agent_step_response_format()
 
 ORCHESTRATOR_SYSTEM = """Sonar orchestrator. Each turn: output exactly ONE JSON object (schema). No prose outside JSON.
 
-Actions: final_answer | spawn_subagents | wait_subagents.
+Actions: final_answer | spawn_subagents | wait_subagents | call_tools.
+
+Environment (workspace):
+- You operate under a **local workspace** (absolute path below). Paths the user gives are usually relative to that root unless they are absolute paths already inside the tree.
+- **Word sense:** here **workspace** = **project root / working directory on disk** only. It is **not** Google Workspace, Microsoft 365, Notion, or any cloud product. **Never** mention Google Workspace (or similar) unless the user explicitly asks about that product by name.
+- If the user asks which workspace you are in, answer with that local path only (briefly). Do not deny or "clarify" using unrelated product names they did not ask about.
+- **call_tools** runs **read_file**, **list_dir**, and **glob_files** only inside that workspace (the host enforces it). You cannot run shell commands or write files.
+
+If the user asks about **function calling**, **tools**, or **how this agent works**:
+- This loop is **JSON-native**: each turn is one schema object. **call_tools** executes local read-only file tools; **spawn_subagents** / **wait_subagents** run parallel **Sonar** completions (remote), not local execution.
+- Do not claim features that are not implemented (shell, write_file, network beyond Sonar).
 
 Conversational vs research (critical):
-- Pure social / meta: greetings, thanks, goodbye, ok, short chit-chat, or empty-ish prompts (e.g. "hola", "hi", "gracias", "buenas", "qué tal" alone). Use action final_answer only. final_text = brief natural reply in the user's language (1–3 short sentences). Do NOT treat as a web lookup, do NOT write an article, do NOT assume homonyms are the topic (Spanish "hola" = hello, not the magazine "¡Hola!"). No citation markers [1] unless the user explicitly asked for sources or verifiable facts.
+- Pure social / meta: greetings, thanks, goodbye, ok, short chit-chat, or empty-ish prompts (e.g. "hola", "hi", "gracias", "buenas", "qué tal" alone). Use action final_answer only. final_text = brief natural reply in the user's language (1–3 short sentences). Do NOT treat as a web lookup, do NOT write an article, do NOT assume homonyms are the topic (Spanish "hola" = hello, not the magazine "¡Hola!"; "workspace" = local project folder, not Google Workspace). No citation markers [1] unless the user explicitly asked for sources or verifiable facts.
 - Do not spawn_subagents for chit-chat or when the user did not ask for external information.
 - When the user clearly wants facts, news, comparisons, how-tos, definitions, or multi-step research, you may use spawn_subagents as today.
 
@@ -29,53 +47,53 @@ Brevity (mandatory):
 
 Do not invent subagent ids."""
 
-AGENT_STEP_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "agent_step",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["final_answer", "spawn_subagents", "wait_subagents"],
-                },
-                "final_text": {"type": "string"},
-                "subagent_tasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "instruction": {"type": "string"},
-                            "model": {"type": ["string", "null"]},
-                        },
-                        "required": ["instruction", "model"],
-                        "additionalProperties": False,
-                    },
-                },
-                "wait_ids": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["action", "final_text", "subagent_tasks", "wait_ids"],
-            "additionalProperties": False,
-        },
-    },
-}
-
 SUBAGENT_SYSTEM = """Web-grounded subagent. Answer the instruction only.
 
 If the instruction is clearly conversational (greeting/thanks only), reply in one or two sentences in that language without launching a topic article or citations.
+
+If the instruction says "workspace" without naming a product, assume **local project directory**, not Google Workspace or other SaaS.
 
 Style: direct, dense facts. No introduction, no recap of the instruction, no closing moral. No repeating the same point. At most one short paragraph of synthesis after bullets/facts. Cite sources inline once each. If uncertain, one short caveat only."""
 
 DIRECT_ASSISTANT_SYSTEM = """You are perplex-agent: a helpful terminal assistant backed by Perplexity Sonar (optional web grounding).
 
+Environment (workspace):
+- You are tied to a **local workspace** (path below): the **project root / working directory on disk** for this CLI session.
+- **Word sense:** **workspace** here is **only** that folder. It is **not** Google Workspace or any other product with a similar name. **Never** bring up Google Workspace unless the user explicitly asks about Google's product.
+- If they ask which workspace you use, state the path below in one short sentence—no unrelated product disclaimers.
+- When **direct tool mode** is enabled (see appended instructions), non-streaming runs use a JSON tool loop (**read_file**, **list_dir**, **glob_files**). With tools off, you answer in one shot; the user can paste files if needed.
+
+If asked about **function calling** or **tools**:
+- **Orchestrator** mode: JSON steps including **call_tools** (local read-only) plus **spawn_subagents** / **wait_subagents** (remote Sonar).
+- **Direct** mode: either a single completion (tools off) or the same local tools via JSON steps (tools on, non-stream).
+
 Behavior:
-- Greetings, thanks, short social messages, or vague one-word pleasantries: answer naturally in the same language the user used. Keep it brief (1–3 sentences). Do not assume they want a dossier, biography, or article about a product/magazine/brand that merely sounds like what they typed (e.g. Spanish "hola" is hello, not the publication "¡Hola!").
-- When they clearly ask for information, data, news, comparisons, code help, or step-by-step tasks, use your tools/grounding as appropriate and stay factual and concise.
+- Greetings, thanks, short social messages, or vague one-word pleasantries: answer naturally in the same language the user used. Keep it brief (1–3 sentences). Do not assume they want a dossier, biography, or article about a product/magazine/brand that merely sounds like what they typed (e.g. Spanish "hola" is hello, not the publication "¡Hola!"; "workspace" questions = local project path only, not Google Workspace).
+- When they clearly ask for information, data, news, comparisons, code help, or step-by-step tasks, use Sonar grounding when appropriate and stay factual and concise.
 - No fake citations or [1][2] blocks for pure chit-chat. Use citations only when giving web-backed factual answers that warrant them.
 
 Tone: warm, clear, professional."""
+
+
+def planner_system_for_settings(settings: Settings) -> str:
+    """Orchestrator system prompt including workspace root for future tool use."""
+    return (
+        f"{ORCHESTRATOR_SYSTEM}\n\n"
+        f"Workspace root on disk (authoritative): {settings.workspace_dir}\n"
+        "Relative paths in user messages are under this directory unless an absolute path is given.\n\n"
+        f"{TOOLS_CAPABILITY_LINES}"
+    )
+
+
+def direct_system_for_settings(settings: Settings) -> str:
+    """Direct-mode system prompt with workspace context."""
+    body = (
+        f"{DIRECT_ASSISTANT_SYSTEM}\n\n"
+        f"Workspace root on disk (authoritative): {settings.workspace_dir}"
+    )
+    if settings.direct_tools_enabled:
+        body += "\n\n" + DIRECT_TOOL_INSTRUCTIONS
+    return body
 
 
 def _parse_agent_json(raw: str) -> dict[str, Any]:
@@ -112,8 +130,13 @@ class Orchestrator:
         settings: Settings,
         *,
         on_subagent_complete: Callable[[SubagentRecord], Coroutine[Any, Any, None]] | None = None,
+        tool_result_channel: str = "shell",
     ) -> None:
         self._settings = settings
+        self._tool_result_channel = tool_result_channel if tool_result_channel in (
+            "shell",
+            "telegram",
+        ) else "shell"
         self._client = PerplexityClient(
             settings.perplexity_api_key,
             timeout_s=settings.request_timeout_s,
@@ -174,7 +197,7 @@ class Orchestrator:
                 inject_max_chars=self._settings.inject_subagent_max_chars,
             )
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": ORCHESTRATOR_SYSTEM},
+                {"role": "system", "content": planner_system_for_settings(self._settings)},
                 *trimmed,
             ]
             planner_extra = self._settings.extra_for_planner()
@@ -271,6 +294,27 @@ class Orchestrator:
                     await self._manager.wait_ids(ids)
                     block = _format_subagent_block(self._manager, ids)
                     history.append({"role": "user", "content": block})
+                continue
+
+            if action == "call_tools":
+                history.append({"role": "assistant", "content": raw})
+                calls = step.get("tool_calls") or []
+                if not isinstance(calls, list) or not calls:
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[system] call_tools requires a non-empty tool_calls array "
+                                "with read_file, list_dir, or glob_files items (use null for unused fields), "
+                                "or use final_answer with tool_calls []."
+                            ),
+                        }
+                    )
+                    continue
+                block = run_tool_calls(
+                    self._settings, calls, channel=self._tool_result_channel
+                )
+                history.append({"role": "user", "content": block})
                 continue
 
             history.append(
